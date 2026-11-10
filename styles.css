@@ -150,6 +150,10 @@ button { cursor: pointer; }
   padding: 14px 10px; text-align: center; font-weight: 600; box-shadow: var(--shadow);
 }
 .action .ai { display: block; font-size: 26px; margin-bottom: 4px; }
+.action.wide { grid-column: 1 / -1; display: flex; align-items: center; justify-content: center; gap: 8px; }
+.action.wide .ai { display: inline; margin: 0; font-size: 22px; }
+textarea.input { resize: vertical; font-family: inherit; }
+details summary { cursor: pointer; }
 
 .field { display: block; margin-bottom: 10px; }
 .field > span { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px; }

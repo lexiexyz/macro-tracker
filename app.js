@@ -4,7 +4,8 @@
 const CFG = Object.assign({ GOOGLE_CLIENT_ID: '', SHEET_NAME: 'Macro Tracker Data' }, window.APP_CONFIG || {});
 const DAY_START_HOUR = 3;     // a new "day" starts at 3 am
 const MORNING_END_HOUR = 15;  // 3 am-3 pm = morning, 3 pm-3 am = night
-const DEFAULT_GEMINI_MODEL = 'gemini-2.5-flash';
+// Google's alias that always points to the current Flash model, so the app keeps working when versions are retired.
+const DEFAULT_GEMINI_MODEL = 'gemini-flash-latest';
 const SCOPE = 'https://www.googleapis.com/auth/drive.file';
 const BACKUP_REMINDER_DAYS = 14;
 
@@ -270,6 +271,7 @@ function renderAdd(v) {
     <button class="action" data-act="label" type="button"><span class="ai">🏷️</span>Photo of label</button>
     <button class="action" data-act="usda" type="button"><span class="ai">🔎</span>Search USDA</button>
     <button class="action" data-act="manual" type="button"><span class="ai">✏️</span>Enter manually</button>
+    <button class="action wide" data-act="askai" type="button"><span class="ai">🤖</span>Ask any AI (copy prompt, paste reply)</button>
   </div>
   <input class="input" id="foodSearch" type="search" placeholder="Search saved foods" value="${esc(state.search)}" style="margin-bottom:12px">
   <div id="foodLists">${lists}</div>`;
@@ -286,6 +288,7 @@ function renderAdd(v) {
     else if (a === 'label') pickLabelPhoto();
     else if (a === 'usda') usdaSheet();
     else if (a === 'manual') foodFormSheet({ source: 'Manual' });
+    else if (a === 'askai') askAiSheet();
   };
 }
 
@@ -557,11 +560,31 @@ Return ONLY a JSON object with these keys:
 - "notes": short note about anything unusual (e.g. "two columns, used per serving"), else ""
 Rules: If both per-serving and per-100g columns exist, use per serving. If there are "as sold" and "prepared" columns, use "as sold". Use null for any value you cannot read. Never guess a number you cannot see.`;
 
-async function readLabelWithGemini(b64) {
-  const model = (prefs.geminiModel || DEFAULT_GEMINI_MODEL).trim();
+// Ask Gemini which models this key can use and pick the newest stable "flash" model.
+async function findGeminiFlashModel() {
   let r;
+  try { r = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000', { headers: { 'x-goog-api-key': prefs.geminiKey.trim() } }); }
+  catch { return null; }
+  if (!r.ok) return null;
+  const j = await r.json().catch(() => ({}));
+  const names = (j.models || [])
+    .filter(m => (m.supportedGenerationMethods || []).includes('generateContent'))
+    .map(m => String(m.name || '').replace(/^models\//, ''));
+  const ver = n => Number((n.match(/gemini-(\d+(?:\.\d+)?)/) || [])[1] || 0);
+  const byNewest = (a, b) => ver(b) - ver(a);
+  const stable = names.filter(n => /^gemini-\d+(\.\d+)?-flash$/.test(n)).sort(byNewest);
+  if (stable.length) return stable[0];
+  const other = names.filter(n => /^gemini-.*flash/.test(n) && !/(lite|tts|image|live|audio|embed|thinking)/.test(n)).sort(byNewest);
+  return other[0] || null;
+}
+
+const GEMINI_BUSY_FALLBACK = 'gemini-flash-lite-latest';
+const setSheetStatus = msg => { const p = $('#sheetRoot .sheet p'); if (p) p.textContent = msg; };
+const sleep = ms => new Promise(res => setTimeout(res, ms));
+
+async function callGemini(model, b64) {
   try {
-    r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+    return await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-goog-api-key': prefs.geminiKey.trim() },
       body: JSON.stringify({
@@ -570,12 +593,39 @@ async function readLabelWithGemini(b64) {
       }),
     });
   } catch { throw new Error('Could not reach Gemini. Check your connection.'); }
+}
+
+async function readLabelWithGemini(b64, retried) {
+  const model = (prefs.geminiModel || DEFAULT_GEMINI_MODEL).trim();
+  // Busy servers (500/503) are usually temporary: retry after 2 s and 5 s, then try the lighter model once.
+  const plan = [[model, 0], [model, 2000], [model, 5000]];
+  if (model !== GEMINI_BUSY_FALLBACK) plan.push([GEMINI_BUSY_FALLBACK, 0]);
+  let r, usedFallback = false;
+  for (let i = 0; i < plan.length; i++) {
+    const [m, wait] = plan[i];
+    if (wait) await sleep(wait);
+    if (i > 0) setSheetStatus(m === model ? `Gemini is busy, retrying (${i}/2)…` : 'Gemini is still busy, trying the lighter model…');
+    usedFallback = m !== model;
+    r = await callGemini(m, b64);
+    if (r.status !== 500 && r.status !== 503) break;
+  }
+  if (r.status === 500 || r.status === 503 || (usedFallback && !r.ok)) throw new Error('Gemini is overloaded right now (this is on Google\'s side and usually passes within a few minutes). Try the photo again shortly, or enter the values manually.');
   if (!r.ok) {
     const t = await r.text().catch(() => '');
     if (r.status === 429) throw new Error('Gemini free quota is used up for now. Try again later, or enter the values manually.');
     if (r.status === 400 && /API key/i.test(t)) throw new Error('Gemini rejected the API key. Check it in Settings.');
     if (r.status === 403) throw new Error('Gemini refused the request (403). Check that your API key is correct and the Gemini API is enabled for it.');
-    if (r.status === 404) throw new Error(`Gemini model "${model}" was not found. Change the model name in Settings.`);
+    if (r.status === 404) {
+      if (!retried) {
+        const found = await findGeminiFlashModel();
+        if (found && found !== model) {
+          prefs.geminiModel = found; savePrefs();
+          toast(`Switched label reading to ${found}`);
+          return readLabelWithGemini(b64, true);
+        }
+      }
+      throw new Error(`Gemini model "${model}" was not found, and no replacement could be found automatically. Enter a current model name in Settings → Model (see ai.google.dev/gemini-api/docs/models).`);
+    }
     throw new Error(`Gemini error ${r.status}: ${t.slice(0, 200)}`);
   }
   const j = await r.json();
@@ -583,6 +633,137 @@ async function readLabelWithGemini(b64) {
   if (!text) throw new Error('Gemini returned no answer. Try a clearer photo.');
   try { return JSON.parse(text.replace(/^```(?:json)?\s*|\s*```$/g, '')); }
   catch { throw new Error('Gemini answered in an unexpected format. Try again.'); }
+}
+
+/* ---------------- Ask any AI: copy a prompt, paste the reply ---------------- */
+const AI_PLACEHOLDER = '[DESCRIBE WHAT YOU ATE HERE, OR ATTACH A PHOTO]';
+function buildAiPrompt(desc) {
+  return `I'm logging food in a nutrition tracker. Estimate the nutrition for what I ate:
+
+${desc.trim() || AI_PLACEHOLDER}
+
+Reply with ONLY a JSON object in exactly this format (no other text):
+{"items":[{"name":"Banana","serving_desc":"1 medium (118 g)","serving_grams":118,"servings_eaten":1,"calories":105,"carbs_g":27,"protein_g":1.3,"fat_g":0.4,"fiber_g":3.1,"sugar_g":14.4,"sodium_mg":1}]}
+
+Rules:
+- One entry in "items" per food or drink.
+- All nutrient values are for ONE serving as described in "serving_desc"; "servings_eaten" is how many of those servings I ate (can be a decimal).
+- "serving_grams" is the weight in grams of one serving (use null if unknown).
+- Use your best estimate when unsure; use 0 only when the value really is zero.
+- If I attached a photo of a nutrition label, copy the label's numbers exactly.`;
+}
+
+function extractJson(text) {
+  const t = String(text || '').replace(/```(?:json)?/gi, '').replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
+  const starts = [t.indexOf('{'), t.indexOf('[')].filter(i => i >= 0);
+  if (!starts.length) throw new Error('No JSON found in the pasted text. Make sure you copied the AI\'s whole reply.');
+  const start = Math.min(...starts);
+  const end = Math.max(t.lastIndexOf('}'), t.lastIndexOf(']'));
+  try { return JSON.parse(t.slice(start, end + 1)); }
+  catch { throw new Error('The pasted reply isn\'t valid JSON. Ask the AI to "reply with only the JSON", then copy it again.'); }
+}
+
+function parseAiReply(text) {
+  const j = extractJson(text);
+  const arr = Array.isArray(j) ? j : Array.isArray(j.items) ? j.items : [j];
+  const pick = (o, ...keys) => { for (const k of keys) if (o[k] !== undefined && o[k] !== null && o[k] !== '') return num(o[k]); return null; };
+  const items = arr.filter(o => o && typeof o === 'object').map(o => ({
+    name: String(o.name || o.food || '').trim() || 'Food',
+    servingDesc: String(o.serving_desc || o.serving || o.serving_size || '').trim(),
+    servingGrams: pick(o, 'serving_grams', 'grams') ?? '',
+    eaten: pick(o, 'servings_eaten', 'servings', 'quantity') ?? 1,
+    kcal: pick(o, 'calories', 'kcal', 'energy_kcal') ?? '',
+    carbs: pick(o, 'carbs_g', 'carbs', 'carbohydrates_g', 'carbohydrates') ?? '',
+    protein: pick(o, 'protein_g', 'protein') ?? '',
+    fat: pick(o, 'fat_g', 'fat') ?? '',
+    fiber: pick(o, 'fiber_g', 'fiber', 'fibre_g') ?? '',
+    sugar: pick(o, 'sugar_g', 'sugars_g', 'sugar') ?? '',
+    sodium: pick(o, 'sodium_mg', 'sodium') ?? '',
+  }));
+  if (!items.length) throw new Error('The reply had no food items in it.');
+  return items;
+}
+
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); return true; }
+  catch {
+    const ta = document.createElement('textarea'); ta.value = text; ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed'; ta.style.opacity = '0'; document.body.appendChild(ta);
+    ta.select(); ta.setSelectionRange(0, text.length);
+    let ok = false; try { ok = document.execCommand('copy'); } catch { /* ignore */ }
+    ta.remove(); return ok;
+  }
+}
+
+function askAiSheet() {
+  openSheet(`${sheetHead('Ask any AI', 'ChatGPT, Claude, Gemini… any chat assistant works')}
+    <div class="muted small" style="margin-bottom:6px"><strong>1.</strong> Describe what you ate (or leave empty and attach a photo in the AI app).</div>
+    <textarea class="input" id="aiDesc" rows="3" placeholder="e.g. a chicken burrito bowl from Chipotle with rice, beans and guac, and a can of Coke"></textarea>
+    <button class="btn primary block" id="aiCopy" type="button" style="margin-top:8px">📋 Copy prompt</button>
+    <div class="muted small" style="margin:14px 0 6px"><strong>2.</strong> Paste the prompt into the AI, then copy its whole reply and paste it here.</div>
+    <textarea class="input" id="aiReply" rows="5" placeholder='{"items":[ … ]}'></textarea>
+    <button class="btn primary block" id="aiRead" type="button" style="margin-top:8px">Review &amp; log</button>
+    <div id="aiErr"></div>`, sh => {
+    $('#aiCopy', sh).onclick = async () => {
+      const ok = await copyText(buildAiPrompt($('#aiDesc', sh).value));
+      toast(ok ? 'Prompt copied. Paste it into your AI app.' : 'Could not copy automatically. Long-press to copy instead.');
+      if (!ok) { const r = $('#aiReply', sh); r.value = buildAiPrompt($('#aiDesc', sh).value); r.select(); }
+    };
+    $('#aiRead', sh).onclick = () => {
+      try { aiReviewSheet(parseAiReply($('#aiReply', sh).value)); }
+      catch (e) { $('#aiErr', sh).innerHTML = `<div class="banner bad" style="margin-top:10px">${esc(e.message)}</div>`; }
+    };
+  });
+}
+
+function aiReviewSheet(items) {
+  const row = (it, i) => `<div class="card" data-i="${i}" style="padding:10px">
+    <div class="row"><input type="checkbox" data-f="on" checked aria-label="Include">
+      <input class="input grow" data-f="name" value="${esc(it.name)}" style="padding:6px 8px"></div>
+    <div class="grid2" style="margin-top:8px">
+      <label class="field"><span>Servings eaten</span><input data-f="eaten" type="number" inputmode="decimal" step="any" min="0" value="${esc(it.eaten)}"></label>
+      <label class="field"><span>1 serving</span><input data-f="servingDesc" value="${esc(it.servingDesc)}"></label>
+    </div>
+    <details><summary class="small muted">Values per serving: C ${fmt(num(it.carbs))} · P ${fmt(num(it.protein))} · F ${fmt(num(it.fat))} · ${fmt(num(it.kcal))} kcal (tap to edit)</summary>
+      <div class="grid3" style="margin-top:8px">${NUTS.map(n => `<label class="field"><span>${n.label} (${n.unit})</span><input data-f="${n.k}" type="number" inputmode="decimal" step="any" min="0" value="${esc(it[n.k])}"></label>`).join('')}
+        <label class="field"><span>Serving (g)</span><input data-f="servingGrams" type="number" inputmode="decimal" step="any" min="0" value="${esc(it.servingGrams)}"></label></div>
+    </details>
+    <div data-warn></div></div>`;
+  openSheet(`${sheetHead('Check the AI\'s estimate', `Logging to ${fmtDay(state.day)} · AI numbers are estimates`)}
+    <div id="aiItems">${items.map(row).join('')}</div>
+    <div class="card small" id="aiTotal"></div>
+    <button class="btn primary block" id="aiLog" type="button">Log</button>`, sh => {
+    const read = () => $$('[data-i]', sh).map(c => {
+      const g = f => $(`[data-f="${f}"]`, c);
+      const it = { on: g('on').checked, name: g('name').value.trim() || 'Food', eaten: num(g('eaten').value) || 0, servingDesc: g('servingDesc').value.trim(), servingGrams: num(g('servingGrams').value) ?? '' };
+      for (const n of NUTS) it[n.k] = num(g(n.k).value) ?? '';
+      return { it, c };
+    });
+    const update = () => {
+      const rows = read(); const t = Object.fromEntries(NUT_KEYS.map(k => [k, 0])); let n = 0;
+      for (const { it, c } of rows) {
+        const w = calorieCheck(it);
+        $('[data-warn]', c).innerHTML = w ? `<div class="banner small" style="margin:6px 0 0">${esc(w)}</div>` : '';
+        c.style.opacity = it.on ? 1 : 0.5;
+        if (!it.on) continue; n++;
+        for (const k of NUT_KEYS) t[k] += (num(it[k]) || 0) * it.eaten;
+      }
+      $('#aiTotal', sh).innerHTML = `<strong>Total:</strong> Carbs ${fmt(t.carbs)} g · Protein ${fmt(t.protein)} g · Fat ${fmt(t.fat)} g · ${fmt(t.kcal)} kcal`;
+      const b = $('#aiLog', sh); b.textContent = `Log ${n} item${n === 1 ? '' : 's'} to ${fmtDay(state.day)}`; b.disabled = !n;
+    };
+    sh.addEventListener('input', update); sh.addEventListener('change', update); update();
+    $('#aiLog', sh).onclick = () => {
+      let n = 0;
+      for (const { it } of read()) {
+        if (!it.on || !(it.eaten > 0)) continue;
+        const food = { id: uid(), name: it.name, brand: '', barcode: '', servingDesc: it.servingDesc, servingGrams: it.servingGrams, source: 'AI reply', favorite: 0, lastUsed: 0 };
+        for (const k of NUT_KEYS) food[k] = it[k];
+        upsert('foods', food);
+        logFood(food, it.eaten, 'serving'); n++;
+      }
+      closeSheet(); toast(`Logged ${n} item${n === 1 ? '' : 's'}`); state.tab = 'today'; render();
+    };
+  });
 }
 
 /* ---------------- USDA search ---------------- */
