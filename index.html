@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Macro Tracker</title>
+  <meta name="theme-color" content="#1f8a5b">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="Macros">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="apple-touch-icon" href="apple-touch-icon.png">
+  <link rel="icon" href="icon-192.png">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <span class="app-title">Macro Tracker</span>
+    <button id="syncBadge" class="sync-badge" type="button" hidden></button>
+  </header>
+
+  <main id="view" class="view"></main>
+
+  <nav class="tabbar" aria-label="Sections">
+    <button data-tab="today" type="button"><span class="ti">🍽️</span><span>Today</span></button>
+    <button data-tab="add" type="button"><span class="ti">➕</span><span>Add food</span></button>
+    <button data-tab="weight" type="button"><span class="ti">⚖️</span><span>Weight</span></button>
+    <button data-tab="settings" type="button"><span class="ti">⚙️</span><span>Settings</span></button>
+  </nav>
+
+  <div id="sheetRoot"></div>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <input id="labelInput" type="file" accept="image/*" capture="environment" hidden>
+  <input id="barcodePhotoInput" type="file" accept="image/*" capture="environment" hidden>
+  <input id="importInput" type="file" accept="application/json,.json" hidden>
+
+  <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
